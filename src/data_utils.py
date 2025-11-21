@@ -211,7 +211,7 @@ class CIRRDataset(Dataset):
                 - (pair_id, reference_name, rel_caption, group_members) when split == test1
     """
 
-    def __init__(self, split: str, mode: str, preprocess: callable):
+    def __init__(self, split: str, mode: str, preprocess: callable, box_file: str = None):
         """
         :param split: dataset split, should be in ['test', 'train', 'val']
         :param mode: dataset mode, should be in ['relative', 'classic']:
@@ -221,10 +221,12 @@ class CIRRDataset(Dataset):
                         - (reference_name, target_name, rel_caption, group_members) when split == val
                         - (pair_id, reference_name, rel_caption, group_members) when split == test1
         :param preprocess: function which preprocesses the image
+        :param box_file: optional path to JSON file containing bounding boxes
         """
         self.preprocess = preprocess
         self.mode = mode
         self.split = split
+        self.box_file = box_file
 
         if split not in ['test1', 'train', 'val']:
             raise ValueError("split should be in ['test1', 'train', 'val']")
@@ -238,8 +240,22 @@ class CIRRDataset(Dataset):
         # get a mapping from image name to relative path
         with open(base_path / 'cirr_dataset' / 'cirr' / 'image_splits' / f'split.rc2.{split}.json') as f:
             self.name_to_relpath = json.load(f)
+        
+        # load bounding box data if provided
+        self.boxes = {}
+        self.use_boxes = False
+        if box_file is not None:
+            import os
+            box_path = base_path / box_file if not os.path.isabs(box_file) else box_file
+            if os.path.exists(box_path):
+                with open(box_path, 'r') as f:
+                    self.boxes = json.load(f)
+                self.use_boxes = True
+                print(f"Loaded bounding boxes from {box_path} ({len(self.boxes)} images)")
+            else:
+                print(f"Warning: box_file {box_path} not found, boxes will not be used")
 
-        print(f"CIRR {split} dataset in {mode} mode initialized")
+        print(f"CIRR {split} dataset in {mode} mode initialized (use_boxes={self.use_boxes})")
 
     def __getitem__(self, index):
         try:
@@ -254,7 +270,14 @@ class CIRRDataset(Dataset):
                     target_hard_name = self.triplets[index]['target_hard']
                     target_image_path = base_path / 'cirr_dataset' / self.name_to_relpath[target_hard_name]
                     target_image = self.preprocess(PIL.Image.open(target_image_path))
-                    return reference_image, target_image, rel_caption
+                    
+                    # get bounding boxes if available
+                    if self.use_boxes:
+                        ref_boxes = self.boxes.get(reference_name, [])
+                        tgt_boxes = self.boxes.get(target_hard_name, [])
+                        return reference_image, target_image, rel_caption, ref_boxes, tgt_boxes
+                    else:
+                        return reference_image, target_image, rel_caption
 
                 elif self.split == 'val':
                     target_hard_name = self.triplets[index]['target_hard']
@@ -284,6 +307,16 @@ class CIRRDataset(Dataset):
             return len(self.name_to_relpath)
         else:
             raise ValueError("mode should be in ['relative', 'classic']")
+    
+    def get_image_size(self, image_name: str):
+        """
+        Get the original size of an image
+        :param image_name: name of the image
+        :return: (width, height) tuple
+        """
+        image_path = base_path / 'cirr_dataset' / self.name_to_relpath[image_name]
+        with PIL.Image.open(image_path) as img:
+            return img.size
 
 
 class CIRCODataset(Dataset):

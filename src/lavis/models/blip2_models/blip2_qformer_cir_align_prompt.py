@@ -11,6 +11,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.cuda.amp import autocast as autocast
 from torch.nn import functional as F
+from torchvision.ops import roi_align
 
 from lavis.common.registry import registry
 from lavis.models.base_model import all_gather_with_grad, concat_all_gather
@@ -90,6 +91,11 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             torch.zeros(1, num_query_token, self.Qformer.config.hidden_size)
         )
         self.prompt_tokens.data.normal_(mean=0.0, std=self.Qformer.config.initializer_range)
+        
+        # RoI Align region feature projection
+        # Use visual encoder's feature dimension instead of Q-former's hidden size
+        self.region_proj = nn.Linear(self.visual_encoder.num_features, embed_dim)
+        self.use_region_loss = False  # 可以通过配置文件控制
 
 
     def forward(self, samples):
@@ -193,11 +199,21 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         loss_align = F.mse_loss(fusion_output.last_hidden_state[:, : query_tokens.size(1), :].mean(1), 
                                 prompt_tokens.clone().detach().mean(1))
 
-        return {
+        losses = {
             'loss_itc': loss_itc, 
             'loss_rtc': loss_rtc,
             'loss_align': loss_align
         }
+        
+        # 如果提供了region boxes，计算区域级损失
+        if self.use_region_loss and 'region_boxes' in samples and samples['region_boxes'] is not None:
+            loss_region = self.compute_region_loss(
+                image_embeds, taregt_embeds, 
+                samples['region_boxes'], samples.get('target_region_boxes')
+            )
+            losses['loss_region'] = loss_region
+        
+        return losses
 
     @torch.no_grad()
     def generate(
@@ -285,6 +301,113 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             return_dict=True,
         )
         return text_output.last_hidden_state[:, 0, :]
+
+    def extract_region_features(self, image_embeds, boxes, image_size=(224, 224)):
+        """
+        使用RoI Align从图像特征中提取区域特征
+        
+        Args:
+            image_embeds: 图像特征 (B, N, D) 其中N是patch数量
+            boxes: bounding boxes列表，每个元素是该图像的boxes (x1, y1, x2, y2)格式，归一化到[0,1]
+            image_size: 原始图像大小
+        
+        Returns:
+            region_features: 区域特征列表
+        """
+        batch_size = image_embeds.shape[0]
+        hidden_dim = image_embeds.shape[-1]
+        num_patches = image_embeds.shape[1]
+        
+        # 假设image_embeds是从ViT出来的patch特征，需要reshape成feature map
+        # 对于224x224图像，patch_size=16，feature map是14x14
+        # 注意：EVA-CLIP可能包含CLS token，需要去除
+        feature_map_size = int((num_patches) ** 0.5)
+        
+        # 如果不是完全平方数，说明有CLS token，去除第一个token
+        if feature_map_size * feature_map_size != num_patches:
+            feature_map_size = int((num_patches - 1) ** 0.5)
+            image_embeds_no_cls = image_embeds[:, 1:, :]  # 去除CLS token
+        else:
+            image_embeds_no_cls = image_embeds
+        
+        all_region_features = []
+        
+        for i in range(batch_size):
+            if boxes[i] is None or len(boxes[i]) == 0:
+                # 如果没有box，返回空tensor
+                all_region_features.append(torch.empty(0, hidden_dim, device=image_embeds.device))
+                continue
+            
+            # Reshape feature map: (N, D) -> (1, D, H, W)
+            feat_map = image_embeds_no_cls[i].view(feature_map_size, feature_map_size, hidden_dim)
+            feat_map = feat_map.permute(2, 0, 1).unsqueeze(0)  # (1, D, H, W)
+            
+            # 准备RoI boxes: 格式为 (batch_idx, x1, y1, x2, y2)
+            # boxes已经是归一化的[0,1]，需要转换到feature map坐标
+            rois = []
+            for box in boxes[i]:
+                x1, y1, x2, y2 = box
+                # 转换到feature map坐标
+                fx1 = x1 * feature_map_size
+                fy1 = y1 * feature_map_size
+                fx2 = x2 * feature_map_size
+                fy2 = y2 * feature_map_size
+                rois.append([0, fx1, fy1, fx2, fy2])  # batch_idx=0因为是单个图像
+            
+            rois_tensor = torch.tensor(rois, dtype=torch.float32, device=feat_map.device)
+            
+            # RoI Align提取区域特征
+            pooled = roi_align(
+                input=feat_map,
+                boxes=rois_tensor,
+                output_size=(1, 1),  # 池化到1x1
+                spatial_scale=1.0,
+                sampling_ratio=-1,
+                aligned=True,
+            )  # (num_boxes, D, 1, 1)
+            
+            region_feats = pooled.squeeze(-1).squeeze(-1)  # (num_boxes, D)
+            all_region_features.append(region_feats)
+        
+        return all_region_features
+    
+    def compute_region_loss(self, ref_image_embeds, target_image_embeds, ref_boxes, target_boxes):
+        """
+        区域级对比损失 - 使用InfoNCE风格的对比学习
+        
+        策略：在batch内进行对比学习，让正确的(ref, target)对相似度高，
+        而与batch内其他样本的相似度低
+        
+        Args:
+            ref_image_embeds: 参考图像特征 (B, N, D)
+            target_image_embeds: 目标图像特征 (B, N, D)
+            ref_boxes: 参考图像的bounding boxes
+            target_boxes: 目标图像的bounding boxes
+        
+        Returns:
+            loss_region: 区域级对比损失
+        """
+        batch_size = ref_image_embeds.shape[0]
+        
+        # 使用CLS token作为全局特征
+        ref_global = ref_image_embeds[:, 0, :]  # (B, D)
+        tgt_global = target_image_embeds[:, 0, :]  # (B, D)
+        
+        # 投影并归一化
+        ref_proj = F.normalize(self.region_proj(ref_global), dim=-1)  # (B, embed_dim)
+        tgt_proj = F.normalize(self.region_proj(tgt_global), dim=-1)  # (B, embed_dim)
+        
+        # 计算相似度矩阵 (B, B)
+        # sim_matrix[i, j] 表示第i个ref和第j个target的相似度
+        sim_matrix = torch.matmul(ref_proj, tgt_proj.t()) / self.temp  # (B, B)
+        
+        # 对角线是正样本对，其他是负样本
+        labels = torch.arange(batch_size, device=sim_matrix.device)
+        
+        # 使用交叉熵损失（InfoNCE）
+        loss = F.cross_entropy(sim_matrix, labels)
+        
+        return loss
 
     def compute_itm(self, image_inputs, text_ids, text_atts):
         image_atts = torch.ones(image_inputs.size()[:-1], dtype=torch.long).to(

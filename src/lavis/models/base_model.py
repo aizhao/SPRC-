@@ -24,7 +24,12 @@ class BaseModel(nn.Module):
 
     @property
     def device(self):
-        return list(self.parameters())[0].device
+        params = list(self.parameters())
+        if len(params) > 0:
+            return params[0].device
+        else:
+            # Fallback to cuda:0 if no parameters found
+            return torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
     def load_checkpoint(self, url_or_filename):
         """
@@ -148,7 +153,12 @@ class BaseEncoder(nn.Module):
 
     @property
     def device(self):
-        return list(self.parameters())[0].device
+        params = list(self.parameters())
+        if len(params) > 0:
+            return params[0].device
+        else:
+            # Fallback to cuda:0 if no parameters found
+            return torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 
 class SharedQueueMixin:

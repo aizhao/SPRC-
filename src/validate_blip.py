@@ -160,6 +160,9 @@ def generate_fiq_val_predictions(blip_model, relative_val_dataset: FashionIQData
     :return: predicted features and target names
     """
     print(f"Compute FashionIQ {relative_val_dataset.dress_types} validation predictions")
+    
+    # Handle DataParallel wrapped model
+    model = blip_model.module if hasattr(blip_model, 'module') else blip_model
 
     relative_val_loader = DataLoader(dataset=relative_val_dataset, batch_size=16,
                                      num_workers=4, pin_memory=True, collate_fn=collate_fn,
@@ -193,9 +196,9 @@ def generate_fiq_val_predictions(blip_model, relative_val_dataset: FashionIQData
                     name_to_feat))  # To avoid unnecessary computation retrieve the reference image features directly from the index features
             feature_curr = index_features[0]
             if save_memory:
-                feature_curr = feature_curr.to(blip_model.device)
-                reference_image_features = reference_image_features.to(blip_model.device)
-            batch_distance = blip_model.inference(reference_image_features, feature_curr, input_captions)
+                feature_curr = feature_curr.to(model.device)
+                reference_image_features = reference_image_features.to(model.device)
+            batch_distance = model.inference(reference_image_features, feature_curr, input_captions)
             distance.append(batch_distance)
             captions_all += input_captions
 
@@ -370,6 +373,10 @@ def generate_cirr_val_predictions(blip_model, relative_val_dataset: CIRRDataset,
     :return: predicted features, reference names, target names and group members
     """
     print("Compute CIRR validation predictions")
+    
+    # Handle DataParallel wrapped model
+    model = blip_model.module if hasattr(blip_model, 'module') else blip_model
+    
     relative_val_loader = DataLoader(dataset=relative_val_dataset, batch_size=32, num_workers=2,
                                      pin_memory=True, collate_fn=collate_fn)
 
@@ -397,7 +404,7 @@ def generate_cirr_val_predictions(blip_model, relative_val_dataset: CIRRDataset,
             else:
                 reference_image_features = torch.stack(itemgetter(*batch_reference_names)(
                     name_to_feat))  # To avoid unnecessary computation retrieve the reference image features directly from the index features
-            batch_distance = blip_model.inference(reference_image_features, index_features[0], captions)
+            batch_distance = model.inference(reference_image_features, index_features[0], captions)
             distance.append(batch_distance)
             captions_all += captions
 

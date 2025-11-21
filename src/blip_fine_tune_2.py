@@ -55,6 +55,9 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
     update_method = getattr(blip_model, '_update_f_former', None)
     if callable(update_method):
         blip_model._update_f_former()
+    
+    # 强制使用单GPU训练
+    print("Using single GPU for training")
 
     input_dim = 224
 
@@ -226,6 +229,14 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
     update_method = getattr(blip_model, '_update_f_former', None)
     if callable(update_method):
         blip_model._update_f_former()
+    
+    # 启用区域损失（如果配置了）
+    if kwargs.get('use_region_loss', False):
+        blip_model.use_region_loss = True
+        print(f"Region loss enabled with weight: {kwargs.get('loss_region', 0.5)}")
+    
+    # 强制使用单GPU训练
+    print("Using single GPU for training")
 
     # clip_model.eval().float()
     input_dim = 224
@@ -241,14 +252,15 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
         raise ValueError("Preprocess transform should be in ['clip', 'squarepad', 'targetpad']")
 
     # Define the validation datasets
-    relative_val_dataset = CIRRDataset('val', 'relative', preprocess)
+    box_file = kwargs.get('box_file', None)
+    relative_val_dataset = CIRRDataset('val', 'relative', preprocess, box_file=box_file)
     classic_val_dataset = CIRRDataset('val', 'classic', preprocess)
 
     # When fine-tuning only the text encoder we can precompute the index features since they do not change over
     # the epochs
 
     # Define the train dataset and the combining function
-    relative_train_dataset = CIRRDataset('train', 'relative', preprocess)
+    relative_train_dataset = CIRRDataset('train', 'relative', preprocess, box_file=box_file)
     relative_train_loader = DataLoader(dataset=relative_train_dataset, batch_size=batch_size,
                                        num_workers=kwargs['num_workers'], pin_memory=False, collate_fn=collate_fn,
                                        drop_last=True, shuffle=True)
@@ -266,7 +278,7 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
         best_harmonic = 0
         best_geometric = 0
         best_arithmetic = 0
-
+    
     # Define dataframes for CSV logging
     training_log_frame = pd.DataFrame()
     validation_log_frame = pd.DataFrame()
@@ -278,7 +290,14 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
     for epoch in range(num_epochs):
         train_running_results = {'images_in_epoch': 0}
         train_bar = tqdm(relative_train_loader, ncols=150)
-        for idx, (reference_images, target_images, captions) in enumerate(train_bar):
+        for idx, batch_data in enumerate(train_bar):
+            # 处理可变长度的batch数据（有无boxes）
+            if len(batch_data) == 5:
+                reference_images, target_images, captions, ref_boxes, tgt_boxes = batch_data
+            else:
+                reference_images, target_images, captions = batch_data
+                ref_boxes, tgt_boxes = None, None
+            
             # print(scheduler.optimizer.param_groups[0]['lr'])
             images_in_batch = reference_images.size(0)
             step = len(train_bar) * epoch + idx
@@ -290,13 +309,23 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
             blip_model.train()
             # Extract the features, compute the logits and the loss
             with torch.cuda.amp.autocast():
-                loss_dict = blip_model({"image":reference_images, "target":target_images, "text_input":captions})
+                loss_dict = blip_model({"image":reference_images, "target":target_images, "text_input":captions, 
+                                       "region_boxes": ref_boxes, "target_region_boxes": tgt_boxes})
+                
+                # For multi-GPU training, each loss in loss_dict might be a vector, need to take mean
+                for key in loss_dict.keys():
+                    if loss_dict[key].dim() > 0:
+                        loss_dict[key] = loss_dict[key].mean()
+                
                 loss = 0.
                 for key in loss_dict.keys():
-                    if key != 'loss_itc':
-                        loss += kwargs[key] * loss_dict[key]
-                    else:
+                    if key == 'loss_itc':
                         loss += loss_dict[key]
+                    elif key == 'loss_region':
+                        loss += kwargs.get('loss_region', 0.5) * loss_dict[key]
+                    else:
+                        loss += kwargs.get(key, 1.0) * loss_dict[key]
+            
             # Backpropagate and update the weights
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -379,6 +408,10 @@ if __name__ == '__main__':
     parser.add_argument("--loss-align", default=0.4, type=float)
     parser.add_argument("--loss-rtc", default=0.4, type=float)
     parser.add_argument("--loss-itm", default=1, type=float)
+    parser.add_argument("--loss-region", default=0.5, type=float, help="Weight for region-level contrastive loss")
+    parser.add_argument("--use-region-loss", dest="use_region_loss", action='store_true',
+                        help="Whether to use RoI Align region loss")
+    parser.add_argument("--box-file", type=str, default=None, help="Path to JSON file containing bounding boxes")
     parser.add_argument("--validation-frequency", default=1, type=int, help="Validation frequency expressed in epochs")
     parser.add_argument("--target-ratio", default=1.25, type=float, help="TargetPad target ratio")
     parser.add_argument("--transform", default="targetpad", type=str,
@@ -410,6 +443,9 @@ if __name__ == '__main__':
         "loss_rtc": args.loss_rtc,
         "loss_align": args.loss_align,
         "loss_itm": args.loss_itm,
+        "loss_region": args.loss_region,
+        "use_region_loss": args.use_region_loss,
+        "box_file": args.box_file,
         "save_memory": args.save_memory
     }
     # set_seed(912)

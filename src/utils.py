@@ -56,6 +56,10 @@ def extract_index_blip_features(dataset: Union[CIRRDataset, FashionIQDataset,CIR
     index_features = []
     index_features_raw = []
     index_names = []
+    
+    # Handle DataParallel wrapped model
+    model = blip_model.module if hasattr(blip_model, 'module') else blip_model
+    
     if isinstance(dataset, CIRRDataset):
         print(f"extracting CIRR {dataset.split} index features")
     elif isinstance(dataset, FashionIQDataset):
@@ -63,7 +67,7 @@ def extract_index_blip_features(dataset: Union[CIRRDataset, FashionIQDataset,CIR
     for names, images in tqdm(classic_val_loader):
         images = images.to(device, non_blocking=True)
         with torch.no_grad():
-            image_features, image_embeds_frozen = blip_model.extract_target_features(images,  mode="mean")
+            image_features, image_embeds_frozen = model.extract_target_features(images,  mode="mean")
             if save_memory:
                 image_features = image_features.cpu()
                 image_embeds_frozen = image_embeds_frozen.cpu()
@@ -141,11 +145,30 @@ def generate_randomized_fiq_caption(flattened_captions: List[str]) -> List[str]:
 def collate_fn(batch: list):
     """
     Discard None images in a batch when using torch DataLoader
+    Handle variable-length bounding boxes by keeping them as lists
     :param batch: input_batch
     :return: output_batch = input_batch - None_values
     """
     batch = list(filter(lambda x: x is not None, batch))
-    return torch.utils.data.dataloader.default_collate(batch)
+    
+    # Check if batch contains bounding boxes (5 elements) or not (3 elements)
+    if len(batch) > 0 and len(batch[0]) == 5:
+        # Separate boxes from other elements
+        reference_images = [item[0] for item in batch]
+        target_images = [item[1] for item in batch]
+        captions = [item[2] for item in batch]
+        ref_boxes = [item[3] for item in batch]  # Keep as list of lists
+        tgt_boxes = [item[4] for item in batch]  # Keep as list of lists
+        
+        # Collate images and captions normally
+        reference_images = torch.utils.data.dataloader.default_collate(reference_images)
+        target_images = torch.utils.data.dataloader.default_collate(target_images)
+        captions = captions  # Keep as list
+        
+        return reference_images, target_images, captions, ref_boxes, tgt_boxes
+    else:
+        # No boxes, use default collate
+        return torch.utils.data.dataloader.default_collate(batch)
 
 
 def update_train_running_results(train_running_results: dict, loss: torch.tensor, images_in_batch: int):
@@ -215,8 +238,15 @@ def save_model(name: str, cur_epoch: int, model_to_save: nn.Module, training_pat
     """
     models_path = training_path / "saved_models"
     models_path.mkdir(exist_ok=True, parents=True)
-    model_name = model_to_save.__class__.__name__
+    
+    # Handle DataParallel wrapper
+    if isinstance(model_to_save, nn.DataParallel):
+        model = model_to_save.module
+    else:
+        model = model_to_save
+    
+    model_name = model.__class__.__name__
     torch.save({
         'epoch': cur_epoch,
-        model_name: model_to_save.state_dict(),
+        model_name: model.state_dict(),
     }, str(models_path / f'{name}.pt'))
