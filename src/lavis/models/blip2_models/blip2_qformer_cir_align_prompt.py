@@ -23,6 +23,87 @@ from lavis.models.blip2_models.blip2 import (
 from lavis.models.blip_models.blip_outputs import BlipOutput, BlipOutputFeatures
 
 
+class GatedFusionModule(nn.Module):
+    """
+    门控融合模块：让文本选择性地修改图像特征
+    
+    核心思想：
+    1. 文本生成门控信号，决定哪些图像特征需要修改
+    2. 文本生成修改向量，指导如何修改
+    3. 通过门控机制平滑地融合原始特征和修改后的特征
+    
+    公式：
+    gate = sigmoid(W_g * [image_feat; text_feat_projected])
+    delta = tanh(W_d * text_feat_projected)
+    fused_feat = image_feat + alpha * gate * delta
+    
+    注意：支持image_feat和text_feat维度不同的情况
+    """
+    def __init__(self, image_dim, text_dim, dropout=0.1):
+        super().__init__()
+        self.image_dim = image_dim  # 图像特征维度 (e.g., 1088)
+        self.text_dim = text_dim    # 文本特征维度 (e.g., 768)
+        
+        # 文本投影：将文本特征投影到图像特征空间
+        self.text_proj = nn.Linear(text_dim, image_dim)
+        
+        # 门控网络：决定修改的程度
+        self.gate_net = nn.Sequential(
+            nn.Linear(image_dim * 2, image_dim),
+            nn.LayerNorm(image_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(image_dim, image_dim),
+            nn.Sigmoid()  # 输出[0,1]的门控信号
+        )
+        
+        # 修改网络：生成修改向量
+        self.delta_net = nn.Sequential(
+            nn.Linear(image_dim, image_dim),
+            nn.LayerNorm(image_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(image_dim, image_dim),
+            nn.Tanh()  # 输出[-1,1]的修改向量
+        )
+        
+        # 残差连接的权重
+        self.alpha = nn.Parameter(torch.ones(1) * 0.5)
+        
+    def forward(self, image_feat, text_feat):
+        """
+        Args:
+            image_feat: (B, N, D_img) - 图像特征，D_img = image_dim
+            text_feat: (B, M, D_txt) - 文本特征，D_txt = text_dim
+        
+        Returns:
+            fused_feat: (B, N, D_img) - 融合后的特征
+        """
+        batch_size, num_img_tokens, _ = image_feat.shape
+        _, num_txt_tokens, _ = text_feat.shape
+        
+        # 使用文本的平均池化作为全局文本表示
+        text_global = text_feat.mean(dim=1, keepdim=True)  # (B, 1, D_txt)
+        
+        # 将文本投影到图像特征空间
+        text_global_proj = self.text_proj(text_global)  # (B, 1, D_img)
+        text_global_proj = text_global_proj.expand(-1, num_img_tokens, -1)  # (B, N, D_img)
+        
+        # 拼接图像和投影后的文本特征用于门控
+        concat_feat = torch.cat([image_feat, text_global_proj], dim=-1)  # (B, N, 2*D_img)
+        
+        # 计算门控信号：决定每个位置修改的程度
+        gate = self.gate_net(concat_feat)  # (B, N, D_img)
+        
+        # 计算修改向量：文本指导的修改方向
+        delta = self.delta_net(text_global_proj)  # (B, N, D_img)
+        
+        # 门控融合：只在需要的地方应用修改
+        fused_feat = image_feat + self.alpha * gate * delta
+        
+        return fused_feat
+
+
 @registry.register_model("blip2_cir_align_prompt")
 class Blip2QformerCirAlignPrompt(Blip2Base):
     """
@@ -96,6 +177,16 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         # Use visual encoder's feature dimension instead of Q-former's hidden size
         self.region_proj = nn.Linear(self.visual_encoder.num_features, embed_dim)
         self.use_region_loss = False  # 可以通过配置文件控制
+        
+        # 门控融合模块 - 改进文本-图像融合机制
+        # 注意：image_embeds来自visual_encoder，维度是visual_encoder.num_features (1088)
+        #      text_embeds来自Qformer.bert.embeddings，维度是Qformer.config.hidden_size (768)
+        self.gated_fusion = GatedFusionModule(
+            image_dim=self.visual_encoder.num_features,  # 1088
+            text_dim=self.Qformer.config.hidden_size,     # 768
+            dropout=0.1
+        )
+        self.use_gated_fusion = True  # 是否使用门控融合
 
 
     def forward(self, samples):
@@ -122,13 +213,25 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             max_length=self.max_txt_len,
             return_tensors="pt",
         ).to(image.device)
+        # 门控融合：让文本选择性地修改图像特征
+        if self.use_gated_fusion:
+            # 先获取文本的初步表示
+            text_embeds = self.Qformer.bert.embeddings(
+                input_ids=text_tokens.input_ids
+            )  # (B, L_text, D)
+            
+            # 应用门控融合
+            image_embeds_fused = self.gated_fusion(image_embeds, text_embeds)
+        else:
+            image_embeds_fused = image_embeds
+        
         # fusion reference image and text tokens into a set of multi-modal tokens
         attention_mask = torch.cat([query_atts, text_tokens.attention_mask], dim=1)
         fusion_output = self.Qformer.bert(
             text_tokens.input_ids,
             query_embeds=query_tokens,
             attention_mask=attention_mask,
-            encoder_hidden_states=image_embeds,
+            encoder_hidden_states=image_embeds_fused,  # 使用融合后的图像特征
             encoder_attention_mask=image_atts,
             return_dict=True,
         )
