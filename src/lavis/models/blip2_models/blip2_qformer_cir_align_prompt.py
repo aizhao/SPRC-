@@ -187,6 +187,11 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             dropout=0.1
         )
         self.use_gated_fusion = True  # 是否使用门控融合
+        
+        # 难负样本挖掘参数
+        self.use_hard_negatives = False  # 是否使用难负样本
+        self.hard_negative_ratio = 0.5   # 难负样本占比
+        self.hard_negative_weight = 0.5  # 难负样本损失权重
 
 
     def forward(self, samples):
@@ -264,17 +269,28 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             self.vision_proj(target_output.last_hidden_state), dim=-1
         )
 
-        sim_t2q = torch.matmul(
-            fusion_feats.unsqueeze(1).unsqueeze(1), target_feats.permute(0, 2, 1)
-        ).squeeze()
+        # 计算loss_itc
+        # 支持难负样本：如果提供了hard_negative_targets，使用难负样本损失
+        if 'hard_negative_targets' in samples and samples['hard_negative_targets'] is not None:
+            # 使用难负样本增强的损失
+            loss_itc = self._compute_hard_negative_loss(
+                fusion_feats, 
+                target_feats,
+                samples.get('hard_negative_feats', None)
+            )
+        else:
+            # 标准对比损失
+            sim_t2q = torch.matmul(
+                fusion_feats.unsqueeze(1).unsqueeze(1), target_feats.permute(0, 2, 1)
+            ).squeeze()
 
-        sim_i2t, _ = sim_t2q.max(-1)
-        sim_i2t = sim_i2t / self.temp
-        bs = image.size(0)
-        targets = torch.linspace(0,  bs - 1, bs, dtype=int).to(
-            image.device
-        )
-        loss_itc = F.cross_entropy(sim_i2t, targets)
+            sim_i2t, _ = sim_t2q.max(-1)
+            sim_i2t = sim_i2t / self.temp
+            bs = image.size(0)
+            targets = torch.linspace(0,  bs - 1, bs, dtype=int).to(
+                image.device
+            )
+            loss_itc = F.cross_entropy(sim_i2t, targets)
 
          ###============== Relative Contrastive ===================###
         prompt_tokens = self.prompt_tokens.expand(image_embeds.shape[0], -1, -1)
@@ -317,6 +333,60 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             losses['loss_region'] = loss_region
         
         return losses
+    
+    def _compute_hard_negative_loss(self, fusion_feats, target_feats, hard_negative_feats=None):
+        """
+        计算难负样本增强的对比损失
+        
+        Args:
+            fusion_feats: (B, D) - 融合特征
+            target_feats: (B, 32, D) - 目标图像特征
+            hard_negative_feats: (B, K, 32, D) - 难负样本特征（可选）
+        
+        Returns:
+            loss: 难负样本增强的损失
+        """
+        B = fusion_feats.size(0)
+        
+        # 计算与目标的相似度
+        sim_t2q = torch.matmul(
+            fusion_feats.unsqueeze(1).unsqueeze(1),
+            target_feats.permute(0, 2, 1)
+        ).squeeze()
+        sim_max, _ = sim_t2q.max(-1)  # (B, B)
+        sim_max = sim_max / self.temp
+        
+        # 标准对比损失
+        labels = torch.arange(B, device=sim_max.device)
+        loss_standard = F.cross_entropy(sim_max, labels)
+        
+        # 在线难负样本挖掘
+        num_hard = max(1, int(B * self.hard_negative_ratio))
+        hard_loss = 0
+        
+        for i in range(B):
+            # 找到最难的负样本
+            neg_mask = torch.ones(B, dtype=torch.bool, device=sim_max.device)
+            neg_mask[i] = False
+            neg_sims = sim_max[i][neg_mask]
+            
+            if len(neg_sims) > 0:
+                k = min(num_hard, len(neg_sims))
+                hard_neg_sims = neg_sims.topk(k)[0]
+                pos_sim = sim_max[i, i]
+                
+                # 难负样本损失
+                hard_loss += -torch.log(
+                    torch.exp(pos_sim) / 
+                    (torch.exp(pos_sim) + torch.exp(hard_neg_sims).sum())
+                )
+        
+        hard_loss = hard_loss / B
+        
+        # 组合损失
+        total_loss = loss_standard + self.hard_negative_weight * hard_loss
+        
+        return total_loss
 
     @torch.no_grad()
     def generate(

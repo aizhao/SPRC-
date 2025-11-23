@@ -235,6 +235,26 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
         blip_model.use_region_loss = True
         print(f"Region loss enabled with weight: {kwargs.get('loss_region', 0.5)}")
     
+    # 启用难负样本挖掘（如果配置了）
+    if kwargs.get('use_hard_negatives', False):
+        blip_model.use_hard_negatives = True
+        blip_model.hard_negative_ratio = kwargs.get('hard_negative_ratio', 0.5)
+        blip_model.hard_negative_weight = kwargs.get('hard_negative_weight', 0.5)
+        print(f"Hard negative mining enabled:")
+        print(f"  - Hard negative ratio: {blip_model.hard_negative_ratio}")
+        print(f"  - Hard negative weight: {blip_model.hard_negative_weight}")
+        
+        # 加载预计算的难负样本数据库（如果提供）
+        hard_negative_db = None
+        if kwargs.get('hard_negative_db'):
+            with open(kwargs['hard_negative_db'], 'r') as f:
+                hard_negative_db = json.load(f)
+                hard_negative_db = {int(k): v for k, v in hard_negative_db.items()}
+            print(f"  - Loaded hard negative database: {kwargs['hard_negative_db']}")
+            print(f"  - Database size: {len(hard_negative_db)}")
+    else:
+        hard_negative_db = None
+    
     # 强制使用单GPU训练
     print("Using single GPU for training")
 
@@ -309,22 +329,30 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
             blip_model.train()
             # Extract the features, compute the logits and the loss
             with torch.cuda.amp.autocast():
-                loss_dict = blip_model({"image":reference_images, "target":target_images, "text_input":captions, 
-                                       "region_boxes": ref_boxes, "target_region_boxes": tgt_boxes})
+                # 准备输入样本
+                samples = {
+                    "image": reference_images,
+                    "target": target_images,
+                    "text_input": captions,
+                    "region_boxes": ref_boxes,
+                    "target_region_boxes": tgt_boxes
+                }
                 
-                # For multi-GPU training, each loss in loss_dict might be a vector, need to take mean
-                for key in loss_dict.keys():
-                    if loss_dict[key].dim() > 0:
-                        loss_dict[key] = loss_dict[key].mean()
+                # 如果启用了难负样本，添加标记
+                if kwargs.get('use_hard_negatives', False):
+                    samples["hard_negative_targets"] = True  # 启用难负样本损失
                 
+                loss_dict = blip_model(samples)
                 loss = 0.
                 for key in loss_dict.keys():
-                    if key == 'loss_itc':
-                        loss += loss_dict[key]
-                    elif key == 'loss_region':
-                        loss += kwargs.get('loss_region', 0.5) * loss_dict[key]
+                    if key == 'loss_region':
+                        loss += loss_dict[key] * kwargs.get('loss_region', 0.5)
+                    elif key == 'loss_rtc':
+                        loss += loss_dict[key] * rtc_weights
+                    elif key == 'loss_align':
+                        loss += loss_dict[key] * align_weights
                     else:
-                        loss += kwargs.get(key, 1.0) * loss_dict[key]
+                        loss += loss_dict[key]
             
             # Backpropagate and update the weights
             scaler.scale(loss).backward()
@@ -412,6 +440,17 @@ if __name__ == '__main__':
     parser.add_argument("--use-region-loss", dest="use_region_loss", action='store_true',
                         help="Whether to use RoI Align region loss")
     parser.add_argument("--box-file", type=str, default=None, help="Path to JSON file containing bounding boxes")
+    
+    # Hard negative mining parameters
+    parser.add_argument("--use-hard-negatives", dest="use_hard_negatives", action='store_true',
+                        help="Whether to use hard negative mining")
+    parser.add_argument("--hard-negative-ratio", default=0.5, type=float, 
+                        help="Ratio of hard negatives to mine from batch")
+    parser.add_argument("--hard-negative-weight", default=0.5, type=float,
+                        help="Weight for hard negative loss")
+    parser.add_argument("--hard-negative-db", type=str, default=None,
+                        help="Path to pre-computed hard negatives database (JSON)")
+    
     parser.add_argument("--validation-frequency", default=1, type=int, help="Validation frequency expressed in epochs")
     parser.add_argument("--target-ratio", default=1.25, type=float, help="TargetPad target ratio")
     parser.add_argument("--transform", default="targetpad", type=str,
