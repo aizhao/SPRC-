@@ -19,6 +19,9 @@ model:
 
   # Q-Former
   num_query_token: 32
+  
+  # MaskNetwork (set to true to enable)
+  use_mask: true
 
 
 preprocess:

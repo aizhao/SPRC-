@@ -1,0 +1,90 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Datasets
+cirr_dataset/
+fashionIQ_dataset/
+data/
+datasets/
+*.zip
+*.tar
+*.tar.gz
+
+# Models and Checkpoints
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+checkpoints/
+outputs/
+logs/
+runs/
+wandb/
+tuned_*/
+saved_models/
+pretrained/
+
+# Training outputs
+*.csv
+*.log
+*.json
+training_*/
+validation_*/
+
+# Cache
+.cache/
+*.cache
+cache/
+
+# Generated files
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.dll
+*.dylib
+*.exe
+
+# Temporary files
+tmp/
+temp/
+*.tmp

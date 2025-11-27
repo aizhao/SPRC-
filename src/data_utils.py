@@ -211,7 +211,7 @@ class CIRRDataset(Dataset):
                 - (pair_id, reference_name, rel_caption, group_members) when split == test1
     """
 
-    def __init__(self, split: str, mode: str, preprocess: callable):
+    def __init__(self, split: str, mode: str, preprocess: callable, use_enhanced_text: bool = False):
         """
         :param split: dataset split, should be in ['test', 'train', 'val']
         :param mode: dataset mode, should be in ['relative', 'classic']:
@@ -221,10 +221,12 @@ class CIRRDataset(Dataset):
                         - (reference_name, target_name, rel_caption, group_members) when split == val
                         - (pair_id, reference_name, rel_caption, group_members) when split == test1
         :param preprocess: function which preprocesses the image
+        :param use_enhanced_text: if True, use reference caption + modification text
         """
         self.preprocess = preprocess
         self.mode = mode
         self.split = split
+        self.use_enhanced_text = use_enhanced_text
 
         if split not in ['test1', 'train', 'val']:
             raise ValueError("split should be in ['test1', 'train', 'val']")
@@ -239,7 +241,20 @@ class CIRRDataset(Dataset):
         with open(base_path / 'cirr_dataset' / 'cirr' / 'image_splits' / f'split.rc2.{split}.json') as f:
             self.name_to_relpath = json.load(f)
 
-        print(f"CIRR {split} dataset in {mode} mode initialized")
+        # Load reference captions if using enhanced text
+        self.reference_captions = {}
+        if use_enhanced_text:
+            caption_file = base_path / 'cirr_dataset' / 'cirr' / 'captions' / f'reference_captions.{split}.json'
+            if caption_file.exists():
+                with open(caption_file, 'r') as f:
+                    self.reference_captions = json.load(f)
+                print(f"Loaded {len(self.reference_captions)} reference captions")
+            else:
+                print(f"Warning: Reference captions file not found: {caption_file}")
+                print("Run 'python generate_reference_captions.py' first to generate captions")
+                self.use_enhanced_text = False
+
+        print(f"CIRR {split} dataset in {mode} mode initialized (enhanced_text={self.use_enhanced_text})")
 
     def __getitem__(self, index):
         try:
@@ -247,6 +262,14 @@ class CIRRDataset(Dataset):
                 group_members = self.triplets[index]['img_set']['members']
                 reference_name = self.triplets[index]['reference']
                 rel_caption = self.triplets[index]['caption']
+                
+                # Enhance text with reference caption if enabled
+                if self.use_enhanced_text and reference_name in self.reference_captions:
+                    ref_caption = self.reference_captions[reference_name]
+                    # Format: "reference_caption. modification_text"
+                    enhanced_caption = f"{ref_caption}. {rel_caption}"
+                else:
+                    enhanced_caption = rel_caption
 
                 if self.split == 'train':
                     reference_image_path = base_path / 'cirr_dataset' / self.name_to_relpath[reference_name]
@@ -254,15 +277,15 @@ class CIRRDataset(Dataset):
                     target_hard_name = self.triplets[index]['target_hard']
                     target_image_path = base_path / 'cirr_dataset' / self.name_to_relpath[target_hard_name]
                     target_image = self.preprocess(PIL.Image.open(target_image_path))
-                    return reference_image, target_image, rel_caption
+                    return reference_image, target_image, enhanced_caption
 
                 elif self.split == 'val':
                     target_hard_name = self.triplets[index]['target_hard']
-                    return reference_name, target_hard_name, rel_caption, group_members
+                    return reference_name, target_hard_name, enhanced_caption, group_members
 
                 elif self.split == 'test1':
                     pair_id = self.triplets[index]['pairid']
-                    return pair_id, reference_name, rel_caption, group_members
+                    return pair_id, reference_name, enhanced_caption, group_members
 
             elif self.mode == 'classic':
                 image_name = list(self.name_to_relpath.keys())[index]

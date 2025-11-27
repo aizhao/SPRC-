@@ -22,6 +22,38 @@ from lavis.models.blip2_models.blip2 import (
 from lavis.models.blip_models.blip_outputs import BlipOutput, BlipOutputFeatures
 
 
+class MaskNetwork(nn.Module):
+    """MaskNetwork from SmartCLIP for dynamic feature selection"""
+    def __init__(self, input_dim=768, hidden_dim=512, output_dim=256, num_layers=3):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        current_dim = input_dim
+        for i in range(num_layers):
+            next_dim = hidden_dim if i < num_layers - 1 else output_dim
+            self.layers.append(nn.Sequential(
+                nn.Linear(current_dim, next_dim),
+                nn.LayerNorm(next_dim),
+                nn.GELU() if i < num_layers - 1 else nn.Identity()
+            ))
+            current_dim = next_dim
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
+        if x.size(1) > 1:
+            x = x[:, 0, :]
+        else:
+            x = x.squeeze(1)
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
 @registry.register_model("blip2_cir_full")
 class Blip2QformerCirFull(Blip2Base):
     """
@@ -53,10 +85,12 @@ class Blip2QformerCirFull(Blip2Base):
         cross_attention_freq=2,
         embed_dim=256,
         max_txt_len=32,
+        use_mask=False,  # Enable MaskNetwork
     ):
         super().__init__()
 
         self.tokenizer = self.init_tokenizer()
+        self.use_mask = use_mask
 
         self.visual_encoder, self.ln_vision = self.init_vision_encoder(
             vit_model, img_size, drop_path_rate, use_grad_checkpoint, vit_precision
@@ -77,6 +111,7 @@ class Blip2QformerCirFull(Blip2Base):
                 key_orig = name.replace("_query", "")
                 param.data.copy_(state_dict[key_orig])
 
+        self.embed_dim = embed_dim
         self.vision_proj = nn.Linear(self.Qformer.config.hidden_size, embed_dim)
         self.text_proj = nn.Linear(self.Qformer.config.hidden_size, embed_dim)
 
@@ -90,6 +125,17 @@ class Blip2QformerCirFull(Blip2Base):
             torch.zeros(1, num_query_token, self.Qformer.config.hidden_size)
         )
         self.prompt_tokens.data.normal_(mean=0.0, std=self.Qformer.config.initializer_range)
+        
+        # Initialize MaskNetwork if enabled
+        if self.use_mask:
+            self.mask_net = MaskNetwork(
+                input_dim=768,
+                hidden_dim=512,
+                output_dim=embed_dim,
+                num_layers=3
+            )
+            self.mask_proj = nn.Linear(embed_dim, embed_dim)
+            logging.info(f"MaskNetwork initialized with output_dim={embed_dim}")
 
 
     def forward(self, samples):
@@ -116,7 +162,48 @@ class Blip2QformerCirFull(Blip2Base):
             max_length=self.max_txt_len,
             return_tensors="pt",
         ).to(image.device)
-        # fusion reference image and text tokens into a set of multi-modal tokens
+        
+        # Extract raw image features first (before fusion)
+        image_output_raw = self.Qformer.bert(
+            query_embeds=query_tokens,
+            encoder_hidden_states=image_embeds,
+            encoder_attention_mask=image_atts,
+            return_dict=True,
+        )
+        image_feats_raw = F.normalize(
+            self.vision_proj(image_output_raw.last_hidden_state), dim=-1
+        )
+        
+        # Apply MaskNetwork if enabled (on raw image features)
+        soft_mask = None
+        image_feats_raw_unmasked = None
+        if self.use_mask:
+            # Save unmasked image features
+            image_feats_raw_unmasked = image_feats_raw.clone()
+            
+            # Generate mask from text features
+            attention_mask = torch.cat([query_atts, text_tokens.attention_mask], dim=1)
+            prompt_tokens_for_mask = self.prompt_tokens.expand(image_embeds.shape[0], -1, -1)
+            text_only_output_for_mask = self.Qformer.bert(
+                text_tokens.input_ids,
+                query_embeds=prompt_tokens_for_mask,
+                attention_mask=attention_mask,
+                return_dict=True,
+                no_img=True
+            )
+            mask_input = text_only_output_for_mask.last_hidden_state
+            mask_hidden = self.mask_net(mask_input)
+            mask_logits = self.mask_proj(mask_hidden)
+            soft_mask = torch.sigmoid(mask_logits)
+            hard_mask = (soft_mask >= 0.5).float() - soft_mask.detach() + soft_mask
+            
+            # Apply mask to raw image features (token-level)
+            # Expand mask to match token dimension
+            hard_mask_expanded = hard_mask.unsqueeze(1).expand_as(image_feats_raw)
+            image_feats_raw = image_feats_raw * hard_mask_expanded
+            image_feats_raw = F.normalize(image_feats_raw, dim=-1)
+        
+        # Now do fusion with masked image features
         attention_mask = torch.cat([query_atts, text_tokens.attention_mask], dim=1)
         fusion_output = self.Qformer.bert(
             text_tokens.input_ids,
@@ -270,11 +357,50 @@ class Blip2QformerCirFull(Blip2Base):
         loss_align = F.mse_loss(fusion_output.last_hidden_state[:, : query_tokens.size(1), :].mean(1), 
                                 prompt_tokens.clone().detach().mean(1))
 
+        # Compute mask-related losses if MaskNetwork is enabled
+        loss_sparsity = torch.tensor(0.0).to(image.device)
+        loss_sidm = torch.tensor(0.0).to(image.device)
+        loss_dism = torch.tensor(0.0).to(image.device)
+        
+        if self.use_mask and soft_mask is not None:
+            # 1. Sparsity Loss: encourage mask to be sparse (penalize large values)
+            loss_sparsity = soft_mask.mean()  # Lower is better (more sparse)
+            
+            # 2. SIDM Loss: Self Image Distillation with Mask
+            # Distill from unmasked image features to masked image features
+            with torch.no_grad():
+                # Compute similarity of unmasked image features with targets
+                sim_raw = torch.matmul(
+                    image_feats_raw_unmasked.unsqueeze(1), target_feats.permute(0, 2, 1)
+                )
+                sim_raw_max, _ = sim_raw.max(-1)
+                sim_raw_max = sim_raw_max.mean(-1)  # Average over query tokens
+                sim_raw_max = sim_raw_max / self.temp
+                teacher_probs = F.softmax(sim_raw_max, dim=-1)
+            
+            # Student: masked image features
+            sim_masked = torch.matmul(
+                image_feats_raw.unsqueeze(1), target_feats.permute(0, 2, 1)
+            )
+            sim_masked_max, _ = sim_masked.max(-1)
+            sim_masked_max = sim_masked_max.mean(-1)
+            sim_masked_max = sim_masked_max / self.temp
+            student_log_probs = F.log_softmax(sim_masked_max, dim=-1)
+            
+            # KL divergence (reduce weight)
+            loss_sidm = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
+            
+            # Remove DISM loss (not helpful)
+            loss_dism = torch.tensor(0.0).to(image.device)
+
         return {
             'loss_itc': loss_itc, 
             'loss_rtc': loss_rtc,
             'loss_itm': loss_itm,
-            'loss_align': loss_align
+            'loss_align': loss_align,
+            'loss_sparsity': loss_sparsity,
+            'loss_sidm': loss_sidm,
+            'loss_dism': loss_dism
         }
 
     @torch.no_grad()
@@ -590,6 +716,7 @@ class Blip2QformerCirFull(Blip2Base):
         freeze_vit = cfg.get("freeze_vit", True)
 
         max_txt_len = cfg.get("max_txt_len", 32)
+        use_mask = cfg.get("use_mask", False)
 
         model = cls(
             vit_model=vit_model,
@@ -601,6 +728,7 @@ class Blip2QformerCirFull(Blip2Base):
             num_query_token=num_query_token,
             cross_attention_freq=cross_attention_freq,
             max_txt_len=max_txt_len,
+            use_mask=use_mask,
         )
         model.load_checkpoint_from_config(cfg)
 

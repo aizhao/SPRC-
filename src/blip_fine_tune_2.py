@@ -240,23 +240,39 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
     else:
         raise ValueError("Preprocess transform should be in ['clip', 'squarepad', 'targetpad']")
 
-    # Define the validation datasets
-    relative_val_dataset = CIRRDataset('val', 'relative', preprocess)
+
+
+    relative_val_dataset = CIRRDataset('val', 'relative', preprocess, use_enhanced_text=True)
     classic_val_dataset = CIRRDataset('val', 'classic', preprocess)
 
     # When fine-tuning only the text encoder we can precompute the index features since they do not change over
     # the epochs
 
-    # Define the train dataset and the combining function
-    relative_train_dataset = CIRRDataset('train', 'relative', preprocess)
+    # Define the train dataset and the combining function (with text enhancement)
+    relative_train_dataset = CIRRDataset('train', 'relative', preprocess, use_enhanced_text=True)
     relative_train_loader = DataLoader(dataset=relative_train_dataset, batch_size=batch_size,
                                        num_workers=kwargs['num_workers'], pin_memory=False, collate_fn=collate_fn,
                                        drop_last=True, shuffle=True)
 
-    # Define the optimizer, the loss and the grad scaler
-    optimizer = optim.AdamW(
-        [{'params': filter(lambda p: p.requires_grad, blip_model.parameters()), 'lr': learning_rate,
-          'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay':0.05}])
+    # Define the optimizer with separate learning rates for MaskNetwork
+    mask_lr = kwargs.get('mask_lr', learning_rate)
+    
+    # Separate MaskNetwork parameters if use_mask is enabled
+    if hasattr(blip_model, 'use_mask') and blip_model.use_mask:
+        mask_params = list(blip_model.mask_net.parameters()) + list(blip_model.mask_proj.parameters())
+        mask_params_ids = {id(p) for p in mask_params}
+        base_params = [p for p in blip_model.parameters() if p.requires_grad and id(p) not in mask_params_ids]
+        
+        optimizer = optim.AdamW([
+            {'params': base_params, 'lr': learning_rate, 'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay': 0.05},
+            {'params': mask_params, 'lr': mask_lr, 'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay': 0.01}
+        ])
+        print(f"Using dual optimizer: base_lr={learning_rate}, mask_lr={mask_lr}")
+    else:
+        optimizer = optim.AdamW(
+            [{'params': filter(lambda p: p.requires_grad, blip_model.parameters()), 'lr': learning_rate,
+              'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay': 0.05}])
+    
     scheduler = OneCycleLR(optimizer, max_lr=learning_rate, pct_start=1/50, steps_per_epoch=len(relative_train_loader), epochs=80)
 
     scaler = torch.cuda.amp.GradScaler()
@@ -294,7 +310,9 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
                 loss = 0.
                 for key in loss_dict.keys():
                     if key != 'loss_itc':
-                        loss += kwargs[key] * loss_dict[key]
+                        # Use weight from kwargs if available, otherwise use 1.0
+                        weight = kwargs.get(key, 1.0)
+                        loss += weight * loss_dict[key]
                     else:
                         loss += loss_dict[key]
             # Backpropagate and update the weights
@@ -375,10 +393,14 @@ if __name__ == '__main__':
     parser.add_argument("--blip-model-name", default="blip2_cir_cat", type=str, help="[blip2_cir_cat, blip2_cir]")
     parser.add_argument("--backbone", type=str, default="pretrain", help="pretrain for vit-g, pretrain_vitL for vit-l")
     parser.add_argument("--learning-rate", default=2e-6, type=float, help="Learning rate")
+    parser.add_argument("--mask-lr", default=1e-3, type=float, help="Learning rate for MaskNetwork")
     parser.add_argument("--batch-size", default=512, type=int, help="Batch size")
     parser.add_argument("--loss-align", default=0.4, type=float)
     parser.add_argument("--loss-rtc", default=0.4, type=float)
     parser.add_argument("--loss-itm", default=1, type=float)
+    parser.add_argument("--loss-sparsity", default=0.5, type=float, help="Sparsity loss weight for MaskNetwork")
+    parser.add_argument("--loss-sidm", default=0.5, type=float, help="SIDM loss weight for MaskNetwork")
+    parser.add_argument("--loss-dism", default=0.5, type=float, help="DISM loss weight for MaskNetwork")
     parser.add_argument("--validation-frequency", default=1, type=int, help="Validation frequency expressed in epochs")
     parser.add_argument("--target-ratio", default=1.25, type=float, help="TargetPad target ratio")
     parser.add_argument("--transform", default="targetpad", type=str,
